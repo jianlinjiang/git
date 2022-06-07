@@ -35,6 +35,8 @@
 #include "commit-reach.h"
 #include "rebase-interactive.h"
 #include "reset.h"
+#include "branch.h"
+#include "log-tree.h"
 
 #define GIT_REFLOG_ACTION "GIT_REFLOG_ACTION"
 
@@ -1689,20 +1691,21 @@ static struct {
 	char c;
 	const char *str;
 } todo_command_info[] = {
-	{ 'p', "pick" },
-	{ 0,   "revert" },
-	{ 'e', "edit" },
-	{ 'r', "reword" },
-	{ 'f', "fixup" },
-	{ 's', "squash" },
-	{ 'x', "exec" },
-	{ 'b', "break" },
-	{ 'l', "label" },
-	{ 't', "reset" },
-	{ 'm', "merge" },
-	{ 0,   "noop" },
-	{ 'd', "drop" },
-	{ 0,   NULL }
+	[TODO_PICK] = { 'p', "pick" },
+	[TODO_REVERT] = { 0,   "revert" },
+	[TODO_EDIT] = { 'e', "edit" },
+	[TODO_REWORD] = { 'r', "reword" },
+	[TODO_FIXUP] = { 'f', "fixup" },
+	[TODO_SQUASH] = { 's', "squash" },
+	[TODO_EXEC] = { 'x', "exec" },
+	[TODO_BREAK] = { 'b', "break" },
+	[TODO_LABEL] = { 'l', "label" },
+	[TODO_RESET] = { 't', "reset" },
+	[TODO_MERGE] = { 'm', "merge" },
+	[TODO_UPDATE_REFS] = { 'u', "update-refs" },
+	[TODO_NOOP] = { 0,   "noop" },
+	[TODO_DROP] = { 'd', "drop" },
+	[TODO_COMMENT] = { 0,   NULL },
 };
 
 static const char *command_to_string(const enum todo_command command)
@@ -2466,7 +2469,9 @@ static int parse_insn_line(struct repository *r, struct todo_item *item,
 	padding = strspn(bol, " \t");
 	bol += padding;
 
-	if (item->command == TODO_NOOP || item->command == TODO_BREAK) {
+	if (item->command == TODO_NOOP ||
+	    item->command == TODO_BREAK ||
+	    item->command == TODO_UPDATE_REFS) {
 		if (bol != eol)
 			return error(_("%s does not accept arguments: '%s'"),
 				     command_to_string(item->command), bol);
@@ -4081,6 +4086,71 @@ leave_merge:
 	return ret;
 }
 
+struct update_refs_context {
+	struct ref_store *refs;
+	char **ref_names;
+	struct object_id *old;
+	struct object_id *new;
+	size_t nr;
+	size_t alloc;
+};
+
+static int add_ref_to_context(const char *refname,
+			      const struct object_id *oid,
+			      int flags,
+			      void *data)
+{
+	int f = 0;
+	const char *name;
+	struct update_refs_context *ctx = data;
+
+	ALLOC_GROW(ctx->ref_names, ctx->nr + 1, ctx->alloc);
+	ALLOC_GROW(ctx->old, ctx->nr + 1, ctx->alloc);
+	ALLOC_GROW(ctx->new, ctx->nr + 1, ctx->alloc);
+
+	if (!skip_prefix(refname, "refs/rewritten/for-update-refs/", &name))
+		return 1;
+
+	ctx->ref_names[ctx->nr] = xstrdup(name);
+	oidcpy(&ctx->new[ctx->nr], oid);
+	if (!refs_resolve_ref_unsafe(ctx->refs, name, 0,
+				     &ctx->old[ctx->nr], &f))
+		return 1;
+
+	ctx->nr++;
+	return 0;
+}
+
+static int do_update_refs(struct repository *r)
+{
+	int i, res;
+	struct update_refs_context ctx = {
+		.refs = get_main_ref_store(r),
+		.alloc = 16,
+	};
+	ALLOC_ARRAY(ctx.ref_names, ctx.alloc);
+	ALLOC_ARRAY(ctx.old, ctx.alloc);
+	ALLOC_ARRAY(ctx.new, ctx.alloc);
+
+	res = refs_for_each_fullref_in(ctx.refs,
+				       "refs/rewritten/for-update-refs/",
+				       add_ref_to_context,
+				       &ctx);
+
+	for (i = 0; !res && i < ctx.nr; i++)
+		res = refs_update_ref(ctx.refs, "rewritten during rebase",
+				ctx.ref_names[i],
+				&ctx.new[i], &ctx.old[i],
+				0, UPDATE_REFS_MSG_ON_ERR);
+
+	for (i = 0; i < ctx.nr; i++)
+		free(ctx.ref_names[i]);
+	free(ctx.ref_names);
+	free(ctx.old);
+	free(ctx.new);
+	return res;
+}
+
 static int is_final_fixup(struct todo_list *todo_list)
 {
 	int i = todo_list->current;
@@ -4456,6 +4526,9 @@ static int pick_commits(struct repository *r,
 				return error_with_patch(r, item->commit,
 							arg, item->arg_len,
 							opts, res, 0);
+		} else if (item->command == TODO_UPDATE_REFS) {
+			if ((res = do_update_refs(r)))
+				reschedule = 1;
 		} else if (!is_noop(item->command))
 			return error(_("unknown command %d"), item->command);
 
@@ -5638,10 +5711,110 @@ static int skip_unnecessary_picks(struct repository *r,
 	return 0;
 }
 
+struct todo_add_branch_context {
+	struct todo_item *items;
+	size_t items_nr;
+	size_t items_alloc;
+	struct strbuf *buf;
+	struct commit *commit;
+};
+
+static int add_branch_for_decoration(const struct name_decoration *d, void *data)
+{
+	struct todo_add_branch_context *ctx = data;
+	size_t base_offset = ctx->buf->len;
+	struct todo_item *item;
+	char *path;
+
+	ALLOC_GROW(ctx->items,
+		   ctx->items_nr + 1,
+		   ctx->items_alloc);
+	item = &ctx->items[ctx->items_nr];
+	memset(item, 0, sizeof(*item));
+
+	/* If the branch is checked out, then leave a comment instead. */
+	if (branch_checked_out(d->name, &path)) {
+		item->command = TODO_COMMENT;
+		strbuf_addf(ctx->buf, "# Ref %s checked out at '%s'\n",
+			    d->name, path);
+		free(path);
+	} else {
+		item->command = TODO_LABEL;
+		strbuf_addf(ctx->buf, "for-update-refs/%s\n", d->name);
+	}
+
+	item->offset_in_buf = base_offset;
+	item->arg_offset = base_offset;
+	item->arg_len = ctx->buf->len - base_offset;
+	ctx->items_nr++;
+
+	return 0;
+}
+
+/*
+ * For each 'pick' command, find out if the commit has a decoration in
+ * refs/heads/. If so, then add a 'label for-update-refs/' command.
+ */
+static int todo_list_add_update_ref_commands(struct todo_list *todo_list)
+{
+	int i;
+	static struct string_list decorate_refs_exclude = STRING_LIST_INIT_NODUP;
+	static struct string_list decorate_refs_exclude_config = STRING_LIST_INIT_NODUP;
+	static struct string_list decorate_refs_include = STRING_LIST_INIT_NODUP;
+	struct decoration_filter decoration_filter = {
+		.include_ref_pattern = &decorate_refs_include,
+		.exclude_ref_pattern = &decorate_refs_exclude,
+		.exclude_ref_config_pattern = &decorate_refs_exclude_config
+	};
+	struct todo_add_branch_context ctx = {
+		.buf = &todo_list->buf,
+	};
+
+	ctx.items_alloc = 2 * todo_list->nr + 1;
+	ALLOC_ARRAY(ctx.items, ctx.items_alloc);
+
+	string_list_append(&decorate_refs_include, "refs/heads/");
+	load_ref_decorations(&decoration_filter, 0);
+
+	for (i = 0; i < todo_list->nr; ) {
+		struct todo_item *item = &todo_list->items[i];
+
+		/* insert ith item into new list */
+		ALLOC_GROW(ctx.items,
+			   ctx.items_nr + 1,
+			   ctx.items_alloc);
+
+		ctx.items[ctx.items_nr++] = todo_list->items[i++];
+
+		if (item->commit) {
+			ctx.commit = item->commit;
+			for_each_decoration(item->commit,
+					    add_branch_for_decoration,
+					    &ctx);
+		}
+	}
+
+	/* Add the "update-refs" step. */
+	ALLOC_GROW(ctx.items,
+		   ctx.items_nr + 1,
+		   ctx.items_alloc);
+	memset(&ctx.items[ctx.items_nr], 0, sizeof(struct todo_item));
+	ctx.items[ctx.items_nr].command = TODO_UPDATE_REFS;
+	ctx.items_nr++;
+
+	free(todo_list->items);
+	todo_list->items = ctx.items;
+	todo_list->nr = ctx.items_nr;
+	todo_list->alloc = ctx.items_alloc;
+
+	return 0;
+}
+
 int complete_action(struct repository *r, struct replay_opts *opts, unsigned flags,
 		    const char *shortrevisions, const char *onto_name,
 		    struct commit *onto, const struct object_id *orig_head,
 		    struct string_list *commands, unsigned autosquash,
+		    unsigned update_refs,
 		    struct todo_list *todo_list)
 {
 	char shortonto[GIT_MAX_HEXSZ + 1];
@@ -5659,6 +5832,9 @@ int complete_action(struct repository *r, struct replay_opts *opts, unsigned fla
 		item->commit = NULL;
 		item->arg_len = item->arg_offset = item->flags = item->offset_in_buf = 0;
 	}
+
+	if (update_refs && todo_list_add_update_ref_commands(todo_list))
+		return -1;
 
 	if (autosquash && todo_list_rearrange_squash(todo_list))
 		return -1;
