@@ -1898,7 +1898,7 @@ static int create_tmpfile(struct strbuf *tmp, const char *filename)
 
 		/* Try again */
 		strbuf_addstr(tmp, "/tmp_obj_XXXXXX");
-		fd = git_mkstemp_mode(tmp->buf, 0444);
+		fd = git_mkstemp_mode(tmp->buf, 0544);
 	}
 	return fd;
 }

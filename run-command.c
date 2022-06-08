@@ -763,7 +763,7 @@ fail_pipe:
 	 * never be released in the child process.  This means only
 	 * Async-Signal-Safe functions are permitted in the child.
 	 */
-	cmd->pid = fork();
+	cmd->pid = vfork();
 	failed_errno = errno;
 	if (!cmd->pid) {
 		int sig;
