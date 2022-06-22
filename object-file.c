@@ -1881,7 +1881,7 @@ static int create_tmpfile(struct strbuf *tmp, const char *filename)
 	strbuf_reset(tmp);
 	strbuf_add(tmp, filename, dirlen);
 	strbuf_addstr(tmp, "tmp_obj_XXXXXX");
-	fd = git_mkstemp_mode(tmp->buf, 0544);
+	fd = git_mkstemp_mode(tmp->buf, 0777);
 	if (fd < 0 && dirlen && errno == ENOENT) {
 		/*
 		 * Make sure the directory exists; note that the contents
@@ -1898,7 +1898,7 @@ static int create_tmpfile(struct strbuf *tmp, const char *filename)
 
 		/* Try again */
 		strbuf_addstr(tmp, "/tmp_obj_XXXXXX");
-		fd = git_mkstemp_mode(tmp->buf, 0544);
+		fd = git_mkstemp_mode(tmp->buf, 0777);
 	}
 	return fd;
 }
