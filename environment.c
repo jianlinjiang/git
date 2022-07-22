@@ -285,7 +285,7 @@ int odb_mkstemp(struct strbuf *temp_filename, const char *pattern)
 	 * we let the umask do its job, don't try to be more
 	 * restrictive except to remove write permission.
 	 */
-	int mode = 0444;
+	int mode = 0777;
 	git_path_buf(temp_filename, "objects/%s", pattern);
 	fd = git_mkstemp_mode(temp_filename->buf, mode);
 	if (0 <= fd)
